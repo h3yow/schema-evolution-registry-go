@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -18,6 +19,7 @@ type ErrorCode string
 const (
 	ErrMalformedSchema     ErrorCode = "MALFORMED_SCHEMA"
 	ErrInvalidStrategy     ErrorCode = "INVALID_STRATEGY"
+	ErrInvalidScope        ErrorCode = "INVALID_SCOPE"
 	ErrVersionConflict     ErrorCode = "VERSION_CONFLICT"
 	ErrVersionOutOfOrder   ErrorCode = "VERSION_OUT_OF_ORDER"
 	ErrVersionNotFound     ErrorCode = "VERSION_NOT_FOUND"
@@ -25,6 +27,7 @@ const (
 	ErrTopicNotFound       ErrorCode = "TOPIC_NOT_FOUND"
 	ErrConsumerNotFound    ErrorCode = "CONSUMER_NOT_FOUND"
 	ErrInvalidConfirmation ErrorCode = "INVALID_CONFIRMATION"
+	ErrInvalidPage         ErrorCode = "INVALID_PAGE"
 	ErrPersistence         ErrorCode = "PERSISTENCE_FAILED"
 )
 
@@ -33,6 +36,63 @@ type Error struct {
 	Code    ErrorCode
 	Message string
 	Reasons []string
+	// Blocking carries the per-version findings that caused an INCOMPATIBLE_SCHEMA
+	// rejection under a multi-version review scope.
+	Blocking []VersionVerdict
+}
+
+// VersionVerdict is the judgement of a candidate against one historical
+// version. When Compatible is false, Changes and Reasons explain exactly what
+// triggered the rejection against that version.
+type VersionVerdict struct {
+	Version    int                  `json:"version"`
+	Strategy   schema.Compatibility `json:"strategy"`
+	Compatible bool                 `json:"compatible"`
+	Changes    []compat.FieldChange `json:"changes,omitempty"`
+	Reasons    []string             `json:"reasons,omitempty"`
+}
+
+// TopicInfo is the read-only view of a topic's configuration.
+type TopicInfo struct {
+	Topic       string
+	Strategy    schema.Compatibility
+	Scope       storage.Scope
+	NextVersion int
+	Latest      int
+}
+
+// VersionPage is one stable, bounded slice of a topic's version history.
+// Versions are always ordered ascending by version number. NextCursor is 0
+// when there are no further versions; otherwise it is passed back verbatim
+// into the next ListVersions call.
+type VersionPage struct {
+	Topic      string
+	Versions   []storage.VersionedSchema
+	Limit      int
+	Cursor     int // first version number this page starts after (0 on the first page)
+	NextCursor int // cursor for the following page, 0 when exhausted
+}
+
+// PreflightOptions optionally overrides the topic's strategy and scope for a
+// single read-only dry run. Zero values mean "use the topic configuration".
+type PreflightOptions struct {
+	Strategy schema.Compatibility
+	Scope    storage.Scope
+}
+
+// PreflightReport is the full result of a register dry run. It never mutates
+// registry state. BlockingVersion is the first (oldest-in-scope) version that
+// rejects the candidate, 0 when every reviewed version passes.
+type PreflightReport struct {
+	Topic           string
+	Strategy        schema.Compatibility
+	Scope           storage.Scope
+	Compatible      bool
+	Verdicts        []VersionVerdict // ascending version order
+	CheckedVersions []int            // ascending version order
+	BlockingVersion int
+	WouldRegister   bool // true when an actual Register would publish a new version
+	ReusedVersion   int  // version reused by fingerprint, 0 otherwise
 }
 
 func (e *Error) Error() string {
@@ -73,10 +133,14 @@ type Options struct {
 // Registry is the local mode schema registry.
 type Registry interface {
 	EnsureTopic(ctx context.Context, topic string, strategy schema.Compatibility) error
+	GetTopic(ctx context.Context, topic string) (TopicInfo, error)
+	ConfigureScope(ctx context.Context, topic string, scope storage.Scope) error
 	Register(ctx context.Context, topic string, s schema.Schema) (RegistrationResult, error)
 	RegisterVersion(ctx context.Context, topic string, version int, s schema.Schema) (RegistrationResult, error)
 	GetVersion(ctx context.Context, topic string, version int) (storage.VersionedSchema, error)
 	GetLatest(ctx context.Context, topic string) (storage.VersionedSchema, error)
+	ListVersions(ctx context.Context, topic string, cursor, limit int) (VersionPage, error)
+	Preflight(ctx context.Context, topic string, candidate schema.Schema, opts PreflightOptions) (PreflightReport, error)
 	QueryByStrategy(ctx context.Context, topic string, strategy schema.Compatibility, candidate schema.Schema) (storage.VersionedSchema, error)
 	Confirm(ctx context.Context, topic, consumer string, version int) error
 	GetConfirmation(ctx context.Context, topic, consumer string) (int, error)
@@ -178,7 +242,7 @@ func (r *localRegistry) ensureTopicLocked(topic string) storage.TopicConfig {
 	if cfg, ok := r.state.Topics[topic]; ok {
 		return cfg
 	}
-	cfg := storage.TopicConfig{Topic: topic, Compatibility: r.defaultStrategy, NextVersion: 1}
+	cfg := storage.TopicConfig{Topic: topic, Compatibility: r.defaultStrategy, NextVersion: 1, Scope: storage.LatestScope()}
 	r.state.Topics[topic] = cfg
 	return cfg
 }
@@ -198,7 +262,12 @@ func (r *localRegistry) EnsureTopic(_ context.Context, topic string, strategy sc
 		return nil
 	}
 	next := cloneState(r.state)
-	next.Topics[topic] = storage.TopicConfig{Topic: topic, Compatibility: strategy, NextVersion: 1}
+	next.Topics[topic] = storage.TopicConfig{
+		Topic:         topic,
+		Compatibility: strategy,
+		NextVersion:   1,
+		Scope:         storage.LatestScope(),
+	}
 	return r.persist(context.Background(), next)
 }
 
@@ -209,6 +278,48 @@ func (r *localRegistry) findByFingerprintLocked(topic, fp string) (storage.Versi
 		}
 	}
 	return storage.VersionedSchema{}, false
+}
+
+// versionsInScope returns the historical baselines a candidate must be checked
+// against, in ascending version order. Versions are stored ascending, so each
+// returned slice is a stable prefix/suffix/window.
+func versionsInScope(versions []storage.VersionedSchema, sc storage.Scope) []storage.VersionedSchema {
+	switch sc.Mode {
+	case storage.ScopeAll:
+		return versions
+	case storage.ScopeRecent:
+		start := len(versions) - sc.Limit
+		if start < 0 {
+			start = 0
+		}
+		return versions[start:]
+	default: // ScopeLatest (also the zero value)
+		if len(versions) == 0 {
+			return nil
+		}
+		return versions[len(versions)-1:]
+	}
+}
+
+// checkScopeLocked evaluates candidate against every baseline in ascending
+// version order and returns one verdict per baseline. The first returned
+// verdict (if any) that is incompatible is the oldest blocking version.
+func (r *localRegistry) checkScopeLocked(ctx context.Context, baselines []storage.VersionedSchema, candidate schema.Schema, strategy schema.Compatibility) ([]VersionVerdict, error) {
+	verdicts := make([]VersionVerdict, 0, len(baselines))
+	for _, base := range baselines {
+		res, err := r.checker.Check(ctx, base.Schema, candidate, strategy)
+		if err != nil {
+			return nil, err
+		}
+		verdicts = append(verdicts, VersionVerdict{
+			Version:    base.Version,
+			Strategy:   strategy,
+			Compatible: res.Compatible,
+			Changes:    res.Changes,
+			Reasons:    res.Reasons,
+		})
+	}
+	return verdicts, nil
 }
 
 // registerLocked validates and appends a new version. wantVersion <= 0 means
@@ -240,25 +351,43 @@ func (r *localRegistry) registerLocked(ctx context.Context, topic string, wantVe
 		return RegistrationResult{}, regErr(ErrMalformedSchema, err.Error())
 	}
 
-	// 4. Compatibility verdict against the latest published version.
+	// 4. Compatibility verdicts against every historical version in scope.
+	//    One rejection blocks the whole registration; every rejected baseline
+	//    is reported so the caller sees exactly which versions break.
 	if len(versions) > 0 && cfg.Compatibility != schema.CompatNone {
-		latest := versions[len(versions)-1]
-		res, err := r.checker.Check(ctx, latest.Schema, s, cfg.Compatibility)
+		baselines := versionsInScope(versions, cfg.Scope)
+		verdicts, err := r.checkScopeLocked(ctx, baselines, s, cfg.Compatibility)
 		if err != nil {
 			if compat.IsMalformed(err) {
 				return RegistrationResult{}, regErr(ErrMalformedSchema, err.Error())
 			}
 			return RegistrationResult{}, regErr(ErrInvalidStrategy, err.Error())
 		}
-		if !res.Compatible {
-			reasons := make([]string, 0, len(res.Reasons)+len(res.Changes))
-			reasons = append(reasons, res.Reasons...)
-			for _, ch := range res.Changes {
-				reasons = append(reasons, "observed: "+ch.String())
+		var blocking []VersionVerdict
+		reasons := make([]string, 0)
+		firstBlocked := 0
+		for _, vd := range verdicts {
+			if vd.Compatible {
+				continue
 			}
-			return RegistrationResult{}, regErr(ErrIncompatibleSchema,
-				fmt.Sprintf("schema rejected by %s strategy of topic %q (baseline v%d)", cfg.Compatibility, topic, latest.Version),
-				reasons...)
+			blocking = append(blocking, vd)
+			if firstBlocked == 0 {
+				firstBlocked = vd.Version
+			}
+			for _, reason := range vd.Reasons {
+				reasons = append(reasons, fmt.Sprintf("v%d: %s", vd.Version, reason))
+			}
+			for _, ch := range vd.Changes {
+				reasons = append(reasons, fmt.Sprintf("v%d observed: %s", vd.Version, ch.String()))
+			}
+		}
+		if len(blocking) > 0 {
+			return RegistrationResult{}, &Error{
+				Code:     ErrIncompatibleSchema,
+				Message:  fmt.Sprintf("schema rejected by %s strategy of topic %q under review scope %s; first blocked at v%d", cfg.Compatibility, topic, cfg.Scope, firstBlocked),
+				Reasons:  reasons,
+				Blocking: blocking,
+			}
 		}
 	}
 
@@ -272,6 +401,7 @@ func (r *localRegistry) registerLocked(ctx context.Context, topic string, wantVe
 		Topic:         topic,
 		Compatibility: cfg.Compatibility,
 		NextVersion:   assigned + 1,
+		Scope:         cfg.Scope,
 	}
 	next.Versions[topic] = append(append([]storage.VersionedSchema(nil), versions...), storage.VersionedSchema{
 		Topic:       topic,
@@ -439,7 +569,191 @@ func (r *localRegistry) ConsumersBehind(_ context.Context, topic string) ([]Cons
 		}
 		views = append(views, view)
 	}
+	// Deterministic ordering: furthest behind first; ties break by consumer
+	// name so repeated queries against unchanged data return the exact same
+	// order, which makes keyset pagination and resumption safe.
+	sort.Slice(views, func(i, j int) bool {
+		if views[i].Confirmed != views[j].Confirmed {
+			return views[i].Confirmed < views[j].Confirmed
+		}
+		return views[i].Consumer < views[j].Consumer
+	})
 	return views, nil
 }
 
 func (r *localRegistry) Close() error { return nil }
+
+// GetTopic returns the read-only configuration view of a topic.
+func (r *localRegistry) GetTopic(_ context.Context, topic string) (TopicInfo, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg, ok := r.state.Topics[topic]
+	if !ok {
+		return TopicInfo{}, regErr(ErrTopicNotFound, fmt.Sprintf("topic %q does not exist", topic))
+	}
+	return TopicInfo{
+		Topic:       cfg.Topic,
+		Strategy:    cfg.Compatibility,
+		Scope:       cfg.Scope,
+		NextVersion: cfg.NextVersion,
+		Latest:      cfg.NextVersion - 1,
+	}, nil
+}
+
+// ConfigureScope sets the per-topic compatibility review range. The choice is
+// persisted in the same snapshot as the topic config, so a restart recovers
+// exactly the configured range instead of reverting to the default.
+func (r *localRegistry) ConfigureScope(ctx context.Context, topic string, scope storage.Scope) error {
+	scope = scope.WithDefaults()
+	if !scope.Valid() {
+		return regErr(ErrInvalidScope,
+			fmt.Sprintf("invalid review scope %q: RECENT requires a positive limit", scope.Mode))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cfg, ok := r.state.Topics[topic]
+	if !ok {
+		return regErr(ErrTopicNotFound, fmt.Sprintf("topic %q does not exist", topic))
+	}
+	next := cloneState(r.state)
+	cfg.Scope = scope
+	next.Topics[topic] = cfg
+	return r.persist(ctx, next)
+}
+
+// Default and maximum page sizes for version history listing.
+const (
+	defaultVersionPageLimit = 20
+	maxVersionPageLimit     = 200
+)
+
+// ListVersions returns an ascending, version-number ordered page of the topic's
+// history. cursor is the version number to start strictly after (0 for the
+// first page); limit<=0 means the default size and values above the cap are
+// clamped. The same data always yields identical page order, and the returned
+// NextCursor resumes the following page exactly.
+func (r *localRegistry) ListVersions(_ context.Context, topic string, cursor, limit int) (VersionPage, error) {
+	if cursor < 0 {
+		return VersionPage{}, regErr(ErrInvalidPage, fmt.Sprintf("cursor must not be negative, got %d", cursor))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	versions := r.state.Versions[topic]
+	if _, ok := r.state.Topics[topic]; !ok {
+		return VersionPage{}, regErr(ErrTopicNotFound, fmt.Sprintf("topic %q does not exist", topic))
+	}
+
+	pageLimit := limit
+	if pageLimit <= 0 {
+		pageLimit = defaultVersionPageLimit
+	}
+	if pageLimit > maxVersionPageLimit {
+		pageLimit = maxVersionPageLimit
+	}
+
+	start := 0
+	for start < len(versions) && versions[start].Version <= cursor {
+		start++
+	}
+	end := start + pageLimit
+	if end > len(versions) {
+		end = len(versions)
+	}
+	pageVersions := append([]storage.VersionedSchema(nil), versions[start:end]...)
+
+	page := VersionPage{Topic: topic, Versions: pageVersions, Limit: pageLimit, Cursor: cursor}
+	if end < len(versions) {
+		page.NextCursor = pageVersions[len(pageVersions)-1].Version
+	}
+	return page, nil
+}
+
+// Preflight is the read-only register dry run. It never publishes a version
+// and never touches consumer confirmations: state is only read. It evaluates
+// the candidate against every version in the (optionally overridden) scope and
+// reports the verdict and reasons for each baseline, so callers can see before
+// committing whether the registration would pass and which version blocks it.
+// A malformed candidate is an error, never a compatible verdict or an empty
+// report.
+func (r *localRegistry) Preflight(ctx context.Context, topic string, candidate schema.Schema, opts PreflightOptions) (PreflightReport, error) {
+	r.mu.Lock()
+	cfg, topicExists := r.state.Topics[topic]
+	versions := append([]storage.VersionedSchema(nil), r.state.Versions[topic]...)
+	r.mu.Unlock()
+
+	if !topicExists {
+		return PreflightReport{}, regErr(ErrTopicNotFound, fmt.Sprintf("topic %q does not exist", topic))
+	}
+
+	// Resolve and validate the effective configuration so bad overrides fail
+	// fast with a classified error.
+	strategy := opts.Strategy
+	if strategy == "" {
+		strategy = cfg.Compatibility
+	}
+	if !validStrategy(strategy) {
+		return PreflightReport{}, regErr(ErrInvalidStrategy, fmt.Sprintf("unknown strategy %q", strategy))
+	}
+	scope := cfg.Scope.WithDefaults()
+	if opts.Scope.Mode != "" {
+		scope = opts.Scope.WithDefaults()
+	}
+	if !scope.Valid() {
+		return PreflightReport{}, regErr(ErrInvalidScope,
+			fmt.Sprintf("invalid review scope %q: RECENT requires a positive limit", scope.Mode))
+	}
+
+	// Structural validation first: a malformed candidate can never pass.
+	if err := r.checker.Validate(ctx, candidate); err != nil {
+		return PreflightReport{}, regErr(ErrMalformedSchema, err.Error())
+	}
+
+	report := PreflightReport{
+		Topic:         topic,
+		Strategy:      strategy,
+		Scope:         scope,
+		Compatible:    true,
+		WouldRegister: true,
+	}
+
+	// Identical content already published: a real Register would reuse it and
+	// publish nothing new.
+	if existing, ok := findByFingerprint(versions, candidate.Fingerprint()); ok {
+		report.WouldRegister = false
+		report.ReusedVersion = existing.Version
+		return report, nil
+	}
+
+	if strategy == schema.CompatNone || len(versions) == 0 {
+		// Nothing to compare against; a valid candidate registers directly.
+		return report, nil
+	}
+
+	baselines := versionsInScope(versions, scope)
+	verdicts, err := r.checkScopeLocked(ctx, baselines, candidate, strategy)
+	if err != nil {
+		if compat.IsMalformed(err) {
+			return PreflightReport{}, regErr(ErrMalformedSchema, err.Error())
+		}
+		return PreflightReport{}, regErr(ErrInvalidStrategy, err.Error())
+	}
+	report.Verdicts = verdicts
+	report.CheckedVersions = make([]int, 0, len(verdicts))
+	for _, vd := range verdicts {
+		report.CheckedVersions = append(report.CheckedVersions, vd.Version)
+		if !vd.Compatible && report.BlockingVersion == 0 {
+			report.BlockingVersion = vd.Version
+		}
+	}
+	report.Compatible = report.BlockingVersion == 0
+	return report, nil
+}
+
+func findByFingerprint(versions []storage.VersionedSchema, fp string) (storage.VersionedSchema, bool) {
+	for _, v := range versions {
+		if v.Fingerprint == fp {
+			return v, true
+		}
+	}
+	return storage.VersionedSchema{}, false
+}

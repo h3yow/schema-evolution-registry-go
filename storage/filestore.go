@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -34,6 +35,19 @@ func Normalize(s State) State {
 	}
 	if s.Confirmations == nil {
 		s.Confirmations = map[string]map[string]int{}
+	}
+	for topic, cfg := range s.Topics {
+		// Snapshots written before review scopes existed carry an empty scope;
+		// they must recover as LATEST, the historical default.
+		cfg.Scope = cfg.Scope.WithDefaults()
+		s.Topics[topic] = cfg
+	}
+	// Version order is a maintained invariant on write; sorting defensively on
+	// load makes the ordering guarantee hold even for hand-edited snapshots.
+	for topic := range s.Versions {
+		sort.SliceStable(s.Versions[topic], func(i, j int) bool {
+			return s.Versions[topic][i].Version < s.Versions[topic][j].Version
+		})
 	}
 	return s
 }

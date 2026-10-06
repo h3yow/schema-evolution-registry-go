@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -63,5 +64,60 @@ func TestFailedSaveKeepsOldSnapshot(t *testing.T) {
 	data, err := readTestFile(blocker)
 	if err != nil || string(data) != "x" {
 		t.Fatalf("existing file corrupted: %q err=%v", data, err)
+	}
+}
+
+func TestScopeRoundTripAndOldSnapshotDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	st := NewFileStore(path)
+	ctx := context.Background()
+
+	s := Normalize(State{})
+	s.Topics["recent"] = TopicConfig{Topic: "recent", Compatibility: "BACKWARD", NextVersion: 1, Scope: RecentScope(3)}
+	s.Topics["all"] = TopicConfig{Topic: "all", Compatibility: "FULL", NextVersion: 1, Scope: AllScope()}
+	s.Topics["latest"] = TopicConfig{Topic: "latest", Compatibility: "BACKWARD", NextVersion: 1, Scope: LatestScope()}
+	if err := st.Save(ctx, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := st.Load(ctx)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if sc := got.Topics["recent"].Scope; sc.Mode != ScopeRecent || sc.Limit != 3 {
+		t.Fatalf("recent scope round-trip = %+v", sc)
+	}
+	if sc := got.Topics["all"].Scope; sc.Mode != ScopeAll {
+		t.Fatalf("all scope round-trip = %+v", sc)
+	}
+	if sc := got.Topics["latest"].Scope; sc.Mode != ScopeLatest {
+		t.Fatalf("latest scope round-trip = %+v", sc)
+	}
+	t.Logf("scopes round-trip: recent=%s all=%s latest=%s",
+		got.Topics["recent"].Scope, got.Topics["all"].Scope, got.Topics["latest"].Scope)
+
+	// Simulate a snapshot written before scopes existed: no "scope" field.
+	legacy := `{"topics":{"old":{"topic":"old","compatibility":"BACKWARD","nextVersion":2}},"versions":{},"confirmations":{}}`
+	legacyPath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy snapshot: %v", err)
+	}
+	old, err := NewFileStore(legacyPath).Load(ctx)
+	if err != nil {
+		t.Fatalf("load legacy: %v", err)
+	}
+	if sc := old.Topics["old"].Scope; sc.Mode != ScopeLatest {
+		t.Fatalf("legacy snapshot must recover LATEST scope, got %+v", sc)
+	}
+	t.Logf("legacy snapshot without scope recovered as %s (no silent revert semantics)", old.Topics["old"].Scope)
+}
+
+func TestNormalizeSortsVersionsAscending(t *testing.T) {
+	s := Normalize(State{
+		Versions: map[string][]VersionedSchema{
+			"t": {{Version: 3}, {Version: 1}, {Version: 2}},
+		},
+	})
+	if got := s.Versions["t"]; got[0].Version != 1 || got[1].Version != 2 || got[2].Version != 3 {
+		t.Fatalf("versions not ascending after normalize: %d %d %d", got[0].Version, got[1].Version, got[2].Version)
 	}
 }
