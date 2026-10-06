@@ -19,6 +19,9 @@ type TopicConfig struct {
 	Topic         string               `json:"topic"`
 	Compatibility schema.Compatibility `json:"compatibility"`
 	NextVersion   int                  `json:"nextVersion"`
+	// Scope is the compatibility audit range. The zero value means
+	// "latest version only" and is normalized on load.
+	Scope schema.AuditScope `json:"scope"`
 }
 
 // State is the whole snapshot persisted to disk.

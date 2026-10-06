@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -25,6 +26,7 @@ const (
 	ErrTopicNotFound       ErrorCode = "TOPIC_NOT_FOUND"
 	ErrConsumerNotFound    ErrorCode = "CONSUMER_NOT_FOUND"
 	ErrInvalidConfirmation ErrorCode = "INVALID_CONFIRMATION"
+	ErrInvalidScope        ErrorCode = "INVALID_SCOPE"
 	ErrPersistence         ErrorCode = "PERSISTENCE_FAILED"
 )
 
@@ -81,6 +83,10 @@ type Registry interface {
 	Confirm(ctx context.Context, topic, consumer string, version int) error
 	GetConfirmation(ctx context.Context, topic, consumer string) (int, error)
 	ConsumersBehind(ctx context.Context, topic string) ([]ConsumerView, error)
+	SetAuditScope(ctx context.Context, topic string, scope schema.AuditScope) error
+	TopicConfig(ctx context.Context, topic string) (storage.TopicConfig, error)
+	Precheck(ctx context.Context, topic string, candidate schema.Schema, opts PrecheckOptions) (PrecheckReport, error)
+	ListVersions(ctx context.Context, topic string, offset, limit int) (VersionPage, error)
 	Close() error
 }
 
@@ -240,25 +246,19 @@ func (r *localRegistry) registerLocked(ctx context.Context, topic string, wantVe
 		return RegistrationResult{}, regErr(ErrMalformedSchema, err.Error())
 	}
 
-	// 4. Compatibility verdict against the latest published version.
+	// 4. Compatibility verdict against every baseline in the topic's audit
+	// scope. Any single in-scope failure rejects the whole registration and
+	// the error names the blocking versions and triggering changes.
 	if len(versions) > 0 && cfg.Compatibility != schema.CompatNone {
-		latest := versions[len(versions)-1]
-		res, err := r.checker.Check(ctx, latest.Schema, s, cfg.Compatibility)
+		scope := cfg.Scope.Normalize()
+		verdicts, err := checkAgainst(ctx, r.checker, scopeVersions(versions, scope), s, cfg.Compatibility)
 		if err != nil {
-			if compat.IsMalformed(err) {
-				return RegistrationResult{}, regErr(ErrMalformedSchema, err.Error())
-			}
-			return RegistrationResult{}, regErr(ErrInvalidStrategy, err.Error())
+			return RegistrationResult{}, err
 		}
-		if !res.Compatible {
-			reasons := make([]string, 0, len(res.Reasons)+len(res.Changes))
-			reasons = append(reasons, res.Reasons...)
-			for _, ch := range res.Changes {
-				reasons = append(reasons, "observed: "+ch.String())
+		for _, v := range verdicts {
+			if !v.Compatible {
+				return RegistrationResult{}, rejectionError(topic, cfg.Compatibility, scope, verdicts)
 			}
-			return RegistrationResult{}, regErr(ErrIncompatibleSchema,
-				fmt.Sprintf("schema rejected by %s strategy of topic %q (baseline v%d)", cfg.Compatibility, topic, latest.Version),
-				reasons...)
 		}
 	}
 
@@ -416,7 +416,9 @@ func (r *localRegistry) GetConfirmation(_ context.Context, topic, consumer strin
 }
 
 // ConsumersBehind returns the views of consumers whose confirmed version is
-// older than the latest published version, oldest lag first.
+// older than the latest published version. The order is stable across calls:
+// larger lag (latest - confirmed) first, ties broken by consumer name, so
+// repeated queries over the same data are identical and safe to page over.
 func (r *localRegistry) ConsumersBehind(_ context.Context, topic string) ([]ConsumerView, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -439,6 +441,13 @@ func (r *localRegistry) ConsumersBehind(_ context.Context, topic string) ([]Cons
 		}
 		views = append(views, view)
 	}
+	sort.Slice(views, func(i, j int) bool {
+		lagI, lagJ := views[i].Latest-views[i].Confirmed, views[j].Latest-views[j].Confirmed
+		if lagI != lagJ {
+			return lagI > lagJ
+		}
+		return views[i].Consumer < views[j].Consumer
+	})
 	return views, nil
 }
 
